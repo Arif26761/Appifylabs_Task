@@ -10,8 +10,11 @@ export const createPost = async (req, res) => {
     if (req.file) {
         const b64 = Buffer.from(req.file.buffer).toString("base64");
         const dataUri = `data:${req.file.mimetype};base64,${b64}`;
+
+        console.log("Uploading to Cloudinary:", req.file?.mimetype);
         const uploadRes = await cloudinary.uploader.upload(dataUri, {
             folder: "appifylab_posts",
+            resource_type: "auto"
         });
         imageUrl = uploadRes.secure_url;
     }
