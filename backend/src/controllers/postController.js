@@ -31,33 +31,103 @@ export const createPost = async (req, res) => {
 
 // POST LIST CONTROLL
 export const listPosts = async (req, res) => {
+  try {
+    const userId = req.user?.id ?? null;
+
+    // 1) Fetch posts + nested comments + replies (no likes include)
     const posts = await prisma.post.findMany({
-        where: {
+      where: {
         OR: [
-            { isPrivate: false },
-            { authorId: req.user.id }, // private visible to author only
+          { isPrivate: false },
+          ...(userId ? [{ authorId: userId }] : []),
         ],
-        },
-        orderBy: { createdAt: "desc" }, // newer posts first
-        include: {
-        author: { select: { id:true, firstName: true, lastName: true } },
-        likes: true,
+      },
+      orderBy: { createdAt: "desc" },
+      include: {
+        author: { select: { id: true, firstName: true, lastName: true } },
         comments: {
-            include: {
-            author: { select: { firstName:true, lastName:true } },
-            likes: true,
+          include: {
+            author: { select: { id: true, firstName: true, lastName: true } },
             replies: {
-                include: {
-                author: { select: { firstName:true, lastName:true } },
-                likes: true,
-                },
-                orderBy: { createdAt: "asc" },
+              include: {
+                author: { select: { id: true, firstName: true, lastName: true } },
+              },
             },
-            },
-            orderBy: { createdAt: "asc" },
+          },
         },
-        },
+      },
     });
 
-    res.json({ posts });
+    // 2) Collect all IDs to fetch likes for (posts, comments, replies)
+    const postIds = posts.map(p => p.id);
+    const commentIds = [];
+    const replyIds = [];
+    posts.forEach(p => {
+      (p.comments || []).forEach(c => {
+        commentIds.push(c.id);
+        (c.replies || []).forEach(r => replyIds.push(r.id));
+      });
+    });
+    const allIds = [...postIds, ...commentIds, ...replyIds];
+
+    // If no ids, just return posts with empty likes arrays
+    if (allIds.length === 0) {
+      const normalizedEmpty = posts.map(p => ({
+        ...p,
+        likes: [],
+        comments: (p.comments || []).map(c => ({ ...c, likes: [], replies: c.replies || [] })),
+      }));
+      return res.json({ posts: normalizedEmpty });
+    }
+
+    // 3) Fetch likes for all targets in one query
+    const likes = await prisma.like.findMany({
+      where: { targetId: { in: allIds } },
+      include: { user: { select: { id: true, firstName: true, lastName: true } } },
+    });
+
+    // 4) Group likes by targetId
+    const likesMap = likes.reduce((acc, like) => {
+      if (!acc[like.targetId]) acc[like.targetId] = [];
+      acc[like.targetId].push({
+        id: like.id,
+        user: like.user,
+        createdAt: like.createdAt,
+        targetType: like.targetType,
+      });
+      return acc;
+    }, {});
+
+    // 5) Attach likes to posts, comments, replies and sort comments/replies
+    const normalized = posts.map((p) => {
+      const pLikes = likesMap[p.id] || [];
+
+      const sortedComments = (p.comments || [])
+        .slice()
+        .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+        .map((c) => {
+          const cLikes = likesMap[c.id] || [];
+          const sortedReplies = (c.replies || [])
+            .slice()
+            .sort((ra, rb) => new Date(ra.createdAt) - new Date(rb.createdAt))
+            .map((r) => {
+              return { ...r, likes: likesMap[r.id] || [] };
+            });
+
+          return { ...c, likes: cLikes, replies: sortedReplies };
+        });
+
+      return { ...p, likes: pLikes, comments: sortedComments };
+    });
+
+    return res.json({ posts: normalized });
+
+  } catch (err) {
+    console.error("List posts error:", err);
+    return res.status(500).json({
+      message: "Failed to list posts",
+      error: err.message,
+      stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
+    });
+  }
 };
